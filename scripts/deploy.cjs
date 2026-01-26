@@ -8,17 +8,17 @@ async function main() {
   // Get the contract factory
   const Wordle = await hre.ethers.getContractFactory("Wordle");
 
-  // Deploy with initial greeting
-  const wordle = await Wordle.deploy(hre.ethers.keccak256(hre.ethers.toUtf8Bytes("dummy")));
+  // Deploy (no constructor parameters needed)
+  const wordle = await Wordle.deploy();
 
   // Wait for deployment to finish
   await wordle.waitForDeployment();
 
   const address = await wordle.getAddress();
-  console.log(`✅ Wordle deployed to: ${address}`);
+  console.log(`Wordle deployed to: ${address}`);
 
   // Get the ABI from compilation artifacts
-  const artifact = require("../artifacts/contracts/Wordle.sol/Wordle.json");
+  const artifact = require("../artifacts/contracts/wordle.sol/Wordle.json");
 
   // Save contract info for the React frontend
   const outputPath = path.join(__dirname, "../src/contracts/Wordle.ts");
@@ -37,7 +37,7 @@ export const WORDLE_ABI = ${JSON.stringify(artifact.abi, null, 2)} as const;
 `;
 
   fs.writeFileSync(outputPath, fileContent);
-  console.log(`✅ Contract info saved to: src/contracts/Wordle.ts`);
+  console.log(`Contract info saved to: src/contracts/Wordle.ts`);
 }
 
 main().catch((error) => {

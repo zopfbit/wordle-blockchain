@@ -1,13 +1,26 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
+import { ethers } from "ethers"
+import { WORDLE_ADDRESS, WORDLE_ABI } from "./contracts/Wordle"
 
-// TODO: Use blockchain APIS
-const WORD = "REACT"
+// Extend Window interface to include ethereum
+declare global {
+  interface Window {
+    ethereum?: {
+      request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+      on: (event: string, callback: (...args: unknown[]) => void) => void;
+      removeListener: (event: string, callback: (...args: unknown[]) => void) => void;
+    };
+  }
+}
+
 const MAX_GUESSES = 6
 const WORD_LENGTH = 5
 
+// Map contract enum to frontend status
 type LetterStatus = "correct" | "present" | "absent" | "empty"
+const statusMap: LetterStatus[] = ["correct", "present", "absent", "empty"]
 
 interface Cell {
   letter: string
@@ -15,6 +28,9 @@ interface Cell {
 }
 
 export default function WordleGame() {
+  const [provider, setProvider] = useState<ethers.BrowserProvider | null>(null)
+  const [contract, setContract] = useState<ethers.Contract | null>(null)
+  const [account, setAccount] = useState<string>("")
   const [gameStarted, setGameStarted] = useState(false)
   const [guesses, setGuesses] = useState<Cell[][]>(
     Array(MAX_GUESSES)
@@ -29,9 +45,130 @@ export default function WordleGame() {
   const [currentRow, setCurrentRow] = useState(0)
   const [gameOver, setGameOver] = useState(false)
   const [won, setWon] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string>("")
 
+  // Connect to a specific account
+  const connectAccount = useCallback(async (browserProvider: ethers.BrowserProvider, accountAddress: string) => {
+    const signer = await browserProvider.getSigner(accountAddress)
+    const wordleContract = new ethers.Contract(WORDLE_ADDRESS, WORDLE_ABI, signer)
+    setContract(wordleContract)
+    setAccount(accountAddress)
+    // Reset game state when switching accounts
+    setGameStarted(false)
+    setCurrentGuess("")
+    setCurrentRow(0)
+    setGameOver(false)
+    setWon(false)
+  }, [])
+
+  // Initialize ethers connection
   useEffect(() => {
-    if (gameOver || !gameStarted) return
+    const init = async () => {
+      if (typeof window.ethereum !== "undefined") {
+        const browserProvider = new ethers.BrowserProvider(window.ethereum)
+        setProvider(browserProvider)
+
+        const accounts = await browserProvider.send("eth_requestAccounts", [])
+        if (accounts.length > 0) {
+          await connectAccount(browserProvider, accounts[0])
+        }
+
+        // Listen for account changes in MetaMask
+        window.ethereum.on("accountsChanged", (async (accounts: unknown) => {
+          const newAccounts = accounts as string[];
+          if (newAccounts.length > 0) {
+            await connectAccount(browserProvider, newAccounts[0])
+          } else {
+            setAccount("")
+            setContract(null)
+          }
+        }))
+      } else {
+        setError("Please install a Web3 wallet to play!")
+      }
+    }
+    init()
+
+    return () => {
+      if (window.ethereum?.removeListener) {
+        window.ethereum.removeListener("accountsChanged", () => { })
+      }
+    }
+  }, [connectAccount])
+
+  // Request to switch account via MetaMask
+  const handleSwitchAccount = async () => {
+    if (window.ethereum) {
+      try {
+        // This opens MetaMask's account selection modal
+        await window.ethereum.request({
+          method: "wallet_requestPermissions",
+          params: [{ eth_accounts: {} }],
+        })
+      } catch (err) {
+        console.error("Error switching account:", err)
+      }
+    }
+  }
+
+  // Convert string to bytes5 hex
+  const stringToBytes5 = (str: string): string => {
+    const bytes = ethers.toUtf8Bytes(str.toUpperCase().padEnd(5, " ").slice(0, 5))
+    return ethers.hexlify(bytes)
+  }
+
+  // Convert bytes5 hex to string
+  const bytes5ToString = (hex: string): string => {
+    if (hex === "0x0000000000") return ""
+    return ethers.toUtf8String(hex).trim()
+  }
+
+  // Load game state from contract
+  const loadGameState = useCallback(async () => {
+    if (!contract) return
+
+    try {
+      const [attempts, gameFinished, hasWon, guessesData, hintsData] = await contract.getMyGame()
+
+      const newGuesses: Cell[][] = Array(MAX_GUESSES)
+        .fill(null)
+        .map(() =>
+          Array(WORD_LENGTH)
+            .fill(null)
+            .map(() => ({ letter: "", status: "empty" as LetterStatus })),
+        )
+
+      for (let i = 0; i < Number(attempts); i++) {
+        const guessStr = bytes5ToString(guessesData[i])
+        for (let j = 0; j < WORD_LENGTH; j++) {
+          newGuesses[i][j] = {
+            letter: guessStr[j] || "",
+            status: statusMap[Number(hintsData[i][j])] || "empty"
+          }
+        }
+      }
+
+      setGuesses(newGuesses)
+      setCurrentRow(Number(attempts))
+      setGameOver(gameFinished)
+      setWon(hasWon)
+      setGameStarted(Number(attempts) > 0 || gameFinished)
+    } catch (err) {
+      console.error("Error loading game:", err)
+    }
+  }, [contract])
+
+  // Load game state on mount
+  useEffect(() => {
+    if (contract && account) {
+      loadGameState()
+    }
+  }, [contract, account, loadGameState])
+
+  // Handle keyboard input
+  useEffect(() => {
+    if (gameOver || !gameStarted || loading) return
 
     const handleKeyPress = (e: KeyboardEvent) => {
       if (e.key === "Enter") {
@@ -45,54 +182,58 @@ export default function WordleGame() {
 
     window.addEventListener("keydown", handleKeyPress)
     return () => window.removeEventListener("keydown", handleKeyPress)
-  }, [currentGuess, currentRow, gameOver, gameStarted])
+  }, [currentGuess, currentRow, gameOver, gameStarted, loading])
 
-  // TODO call transaction guess
-  const checkGuess = (guess: string): Cell[] => {
-    const result: Cell[] = []
-    const wordArray = WORD.split("")
-    const guessArray = guess.split("")
-    const used = Array(WORD_LENGTH).fill(false)
+  // Start game on blockchain
+  const handleStartGame = async () => {
+    if (!contract) return
 
-    for (let i = 0; i < WORD_LENGTH; i++) {
-      if (guessArray[i] === wordArray[i]) {
-        result[i] = { letter: guessArray[i], status: "correct" }
-        used[i] = true
-      } else {
-        result[i] = { letter: guessArray[i], status: "absent" }
-      }
+    setLoading(true)
+    setError("")
+    try {
+      const tx = await contract.startGame()
+      await tx.wait()
+      setGameStarted(true)
+      setGuesses(
+        Array(MAX_GUESSES)
+          .fill(null)
+          .map(() =>
+            Array(WORD_LENGTH)
+              .fill(null)
+              .map(() => ({ letter: "", status: "empty" as LetterStatus })),
+          ),
+      )
+      setCurrentGuess("")
+      setCurrentRow(0)
+      setGameOver(false)
+      setWon(false)
+    } catch (err: unknown) {
+      console.error("Error starting game:", err)
+      setError("Failed to start game. Check console for details.")
+    } finally {
+      setLoading(false)
     }
-
-    for (let i = 0; i < WORD_LENGTH; i++) {
-      if (result[i].status === "correct") continue
-
-      const foundIndex = wordArray.findIndex((letter, idx) => letter === guessArray[i] && !used[idx])
-
-      if (foundIndex !== -1) {
-        result[i] = { letter: guessArray[i], status: "present" }
-        used[foundIndex] = true
-      }
-    }
-
-    return result
   }
 
-  const handleSubmit = () => {
-    if (currentGuess.length !== WORD_LENGTH || gameOver) return
+  // Submit guess to blockchain
+  const handleSubmit = async () => {
+    if (currentGuess.length !== WORD_LENGTH || gameOver || !contract || loading) return
 
-    const result = checkGuess(currentGuess)
-    const newGuesses = [...guesses]
-    newGuesses[currentRow] = result
-    setGuesses(newGuesses)
+    setLoading(true)
+    setError("")
+    try {
+      const guessBytes = stringToBytes5(currentGuess)
+      const tx = await contract.submitGuess(guessBytes)
+      await tx.wait()
 
-    if (currentGuess === WORD) {
-      setWon(true)
-      setGameOver(true)
-    } else if (currentRow === MAX_GUESSES - 1) {
-      setGameOver(true)
-    } else {
-      setCurrentRow((prev) => prev + 1)
+      // Reload game state from contract
+      await loadGameState()
       setCurrentGuess("")
+    } catch (err: unknown) {
+      console.error("Error submitting guess:", err)
+      setError("Failed to submit guess. Check console for details.")
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -110,20 +251,20 @@ export default function WordleGame() {
   }
 
   const resetGame = () => {
-    // TODO call transaction reset/start
-    setGuesses(
-      Array(MAX_GUESSES)
-        .fill(null)
-        .map(() =>
-          Array(WORD_LENGTH)
-            .fill(null)
-            .map(() => ({ letter: "", status: "empty" as LetterStatus })),
-        ),
+    handleStartGame()
+  }
+
+  if (!provider) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+        <div className="bg-white rounded-lg shadow-xl p-8 max-w-md text-center">
+          <h1 className="text-4xl font-bold mb-4 text-gray-800">Wordle</h1>
+          <p className="text-red-600 mb-6">
+            {error || "Please install MetaMask to play!"}
+          </p>
+        </div>
+      </div>
     )
-    setCurrentGuess("")
-    setCurrentRow(0)
-    setGameOver(false)
-    setWon(false)
   }
 
   if (!gameStarted) {
@@ -131,16 +272,26 @@ export default function WordleGame() {
       <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
         <div className="bg-white rounded-lg shadow-xl p-8 max-w-md text-center">
           <h1 className="text-4xl font-bold mb-4 text-gray-800">Wordle</h1>
+          <div className="flex items-center justify-center gap-2 mb-2">
+            <p className="text-gray-600">Connected: {account.slice(0, 6)}...{account.slice(-4)}</p>
+            <button
+              onClick={handleSwitchAccount}
+              className="text-blue-600 hover:text-blue-800 text-sm underline"
+            >
+              Switch
+            </button>
+          </div>
           <p className="text-gray-600 mb-6">
             Guess the 5-letter word in {MAX_GUESSES} tries. Green means correct position, yellow means the letter is in
             the word but wrong position, gray means the letter is not in the word.
           </p>
+          {error && <p className="text-red-600 mb-4">{error}</p>}
           <button
-            // add transaction call start
-            onClick={() => setGameStarted(true)}
-            className="bg-green-600 hover:bg-green-700 text-white font-semibold px-8 py-3 rounded transition-colors"
+            onClick={handleStartGame}
+            disabled={loading}
+            className="bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-semibold px-8 py-3 rounded transition-colors"
           >
-            Start Game
+            {loading ? "Starting..." : "Start Game"}
           </button>
         </div>
       </div>
@@ -150,7 +301,16 @@ export default function WordleGame() {
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        <h1 className="text-4xl font-bold text-center mb-8 text-gray-800">Wordle</h1>
+        <h1 className="text-4xl font-bold text-center mb-2 text-gray-800">Wordle</h1>
+        <div className="flex items-center justify-center gap-2 text-gray-500 text-sm mb-6">
+          <p>Connected: {account.slice(0, 6)}...{account.slice(-4)}</p>
+          <button
+            onClick={handleSwitchAccount}
+            className="text-blue-600 hover:text-blue-800 underline"
+          >
+            Switch
+          </button>
+        </div>
 
         <div className="flex flex-col gap-2 mb-6">
           {guesses.map((guess, rowIndex) => (
@@ -176,26 +336,29 @@ export default function WordleGame() {
           ))}
         </div>
 
+        {error && <p className="text-red-600 text-center mb-4">{error}</p>}
+
         {gameOver && (
           <div className="bg-white rounded-lg shadow-lg p-6 text-center mb-4">
             <h2 className="text-2xl font-bold mb-2 text-gray-800">{won ? "Congratulations!" : "Game Over"}</h2>
             <p className="text-gray-600 mb-4">
               {won
-                ? `You guessed the word in ${currentRow + 1} ${currentRow + 1 === 1 ? "try" : "tries"}!`
-                : `The word was: ${WORD}`}
+                ? `You guessed the word in ${currentRow} ${currentRow === 1 ? "try" : "tries"}!`
+                : "Better luck next time!"}
             </p>
             <button
               onClick={resetGame}
-              className="bg-green-600 hover:bg-green-700 text-white font-semibold px-6 py-2 rounded transition-colors"
+              disabled={loading}
+              className="bg-green-600 hover:bg-green-700 disabled:bg-gray-400 text-white font-semibold px-6 py-2 rounded transition-colors"
             >
-              Play Again
+              {loading ? "Starting..." : "Play Again"}
             </button>
           </div>
         )}
 
         {!gameOver && (
           <div className="text-center text-gray-600">
-            <p className="mb-2">Type your guess and press Enter</p>
+            <p className="mb-2">{loading ? "Submitting to blockchain..." : "Type your guess and press Enter"}</p>
             <p className="text-sm">
               Guess {currentRow + 1} of {MAX_GUESSES}
             </p>
