@@ -49,9 +49,10 @@ export default function WordleGame() {
   const [error, setError] = useState<string>("")
 
   // Helper to load game state from a contract instance
-  const loadGameFromContract = async (wordleContract: ethers.Contract) => {
+  // Returns true if there's a pending guess (waiting for oracle)
+  const loadGameFromContract = async (wordleContract: ethers.Contract): Promise<boolean> => {
     try {
-      const [attempts, gameFinished, hasWon, guessesData, hintsData] = await wordleContract.getMyGame()
+      const [attempts, gameFinished, hasWon, pendingGuess, guessesData, hintsData] = await wordleContract.getMyGame()
 
       const newGuesses: Cell[][] = Array(MAX_GUESSES)
         .fill(null)
@@ -75,7 +76,8 @@ export default function WordleGame() {
       setCurrentRow(Number(attempts))
       setGameOver(gameFinished)
       setWon(hasWon)
-      setGameStarted(Number(attempts) > 0 || gameFinished)
+      setGameStarted(Number(attempts) > 0 || gameFinished || pendingGuess)
+      return pendingGuess
     } catch (err) {
       console.error("Error loading game:", err)
       // Reset to fresh state if loading fails
@@ -83,6 +85,7 @@ export default function WordleGame() {
       setCurrentRow(0)
       setGameOver(false)
       setWon(false)
+      return false
     }
   }
 
@@ -226,7 +229,7 @@ export default function WordleGame() {
     }
   }
 
-  // Submit guess to blockchain
+  // Submit guess to blockchain and wait for oracle
   const handleSubmit = async () => {
     if (currentGuess.length !== WORD_LENGTH || gameOver || !contract || loading) return
 
@@ -236,10 +239,20 @@ export default function WordleGame() {
       const guessBytes = stringToBytes5(currentGuess)
       const tx = await contract.submitGuess(guessBytes)
       await tx.wait()
-
-      // Reload game state from contract
-      await loadGameState()
       setCurrentGuess("")
+
+      // Poll until oracle fulfills the guess
+      let pending = true
+      let attempts = 0
+      while (pending && attempts < 30) {
+        await new Promise(r => setTimeout(r, 500)) // Wait 500ms
+        pending = await loadGameFromContract(contract)
+        attempts++
+      }
+
+      if (pending) {
+        setError("Oracle timeout - please refresh")
+      }
     } catch (err: unknown) {
       console.error("Error submitting guess:", err)
       setError("Failed to submit guess. Check console for details.")
@@ -284,13 +297,32 @@ export default function WordleGame() {
         <div className="bg-white rounded-lg shadow-xl p-8 max-w-md text-center">
           <h1 className="text-4xl font-bold mb-4 text-gray-800">Wordle</h1>
           <div className="flex items-center justify-center gap-2 mb-2">
-            <p className="text-gray-600">Connected: {account.slice(0, 6)}...{account.slice(-4)}</p>
-            <button
-              onClick={handleSwitchAccount}
-              className="text-blue-600 hover:text-blue-800 text-sm underline"
-            >
-              Switch
-            </button>
+            {account ? (
+              <>
+                <p className="text-gray-600">Connected: {account.slice(0, 6)}...{account.slice(-4)}</p>
+                <button
+                  onClick={handleSwitchAccount}
+                  disabled={switchingAccount}
+                  className="bg-gray-200 hover:bg-gray-300 disabled:opacity-50 text-gray-700 text-sm font-medium px-3 py-1 rounded-full transition-colors"
+                >
+                  {switchingAccount ? "..." : "Switch"}
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={async () => {
+                  if (window.ethereum && provider) {
+                    const accounts = await provider.send("eth_requestAccounts", [])
+                    if (accounts.length > 0) {
+                      await connectAccount(provider, accounts[0])
+                    }
+                  }
+                }}
+                className="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-6 py-2 rounded-lg transition-colors"
+              >
+                Connect Wallet
+              </button>
+            )}
           </div>
           <p className="text-gray-600 mb-6">
             Guess the 5-letter word in {MAX_GUESSES} tries. Green means correct position, yellow means the letter is in
@@ -317,9 +349,10 @@ export default function WordleGame() {
           <p>Connected: {account.slice(0, 6)}...{account.slice(-4)}</p>
           <button
             onClick={handleSwitchAccount}
-            className="text-blue-600 hover:text-blue-800 underline"
+            disabled={switchingAccount}
+            className="bg-gray-200 hover:bg-gray-300 disabled:opacity-50 text-gray-700 text-sm font-medium px-3 py-1 rounded-full transition-colors"
           >
-            Switch
+            {switchingAccount ? "..." : "Switch"}
           </button>
         </div>
 
