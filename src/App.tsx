@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback } from "react"
 import { ethers } from "ethers"
 import { WORDLE_ADDRESS, WORDLE_ABI } from "./contracts/Wordle"
 
-// Extend Window interface to include ethereum
+// Extend Window interface, injected by wallet extensions
 declare global {
   interface Window {
     ethereum?: {
@@ -48,88 +48,10 @@ export default function WordleGame() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string>("")
 
-  // Connect to a specific account
-  const connectAccount = useCallback(async (browserProvider: ethers.BrowserProvider, accountAddress: string) => {
-    const signer = await browserProvider.getSigner(accountAddress)
-    const wordleContract = new ethers.Contract(WORDLE_ADDRESS, WORDLE_ABI, signer)
-    setContract(wordleContract)
-    setAccount(accountAddress)
-    // Reset game state when switching accounts
-    setGameStarted(false)
-    setCurrentGuess("")
-    setCurrentRow(0)
-    setGameOver(false)
-    setWon(false)
-  }, [])
-
-  // Initialize ethers connection
-  useEffect(() => {
-    const init = async () => {
-      if (typeof window.ethereum !== "undefined") {
-        const browserProvider = new ethers.BrowserProvider(window.ethereum)
-        setProvider(browserProvider)
-
-        const accounts = await browserProvider.send("eth_requestAccounts", [])
-        if (accounts.length > 0) {
-          await connectAccount(browserProvider, accounts[0])
-        }
-
-        // Listen for account changes in MetaMask
-        window.ethereum.on("accountsChanged", (async (accounts: unknown) => {
-          const newAccounts = accounts as string[];
-          if (newAccounts.length > 0) {
-            await connectAccount(browserProvider, newAccounts[0])
-          } else {
-            setAccount("")
-            setContract(null)
-          }
-        }))
-      } else {
-        setError("Please install a Web3 wallet to play!")
-      }
-    }
-    init()
-
-    return () => {
-      if (window.ethereum?.removeListener) {
-        window.ethereum.removeListener("accountsChanged", () => { })
-      }
-    }
-  }, [connectAccount])
-
-  // Request to switch account via MetaMask
-  const handleSwitchAccount = async () => {
-    if (window.ethereum) {
-      try {
-        // This opens MetaMask's account selection modal
-        await window.ethereum.request({
-          method: "wallet_requestPermissions",
-          params: [{ eth_accounts: {} }],
-        })
-      } catch (err) {
-        console.error("Error switching account:", err)
-      }
-    }
-  }
-
-  // Convert string to bytes5 hex
-  const stringToBytes5 = (str: string): string => {
-    const bytes = ethers.toUtf8Bytes(str.toUpperCase().padEnd(5, " ").slice(0, 5))
-    return ethers.hexlify(bytes)
-  }
-
-  // Convert bytes5 hex to string
-  const bytes5ToString = (hex: string): string => {
-    if (hex === "0x0000000000") return ""
-    return ethers.toUtf8String(hex).trim()
-  }
-
-  // Load game state from contract
-  const loadGameState = useCallback(async () => {
-    if (!contract) return
-
+  // Helper to load game state from a contract instance
+  const loadGameFromContract = async (wordleContract: ethers.Contract) => {
     try {
-      const [attempts, gameFinished, hasWon, guessesData, hintsData] = await contract.getMyGame()
+      const [attempts, gameFinished, hasWon, guessesData, hintsData] = await wordleContract.getMyGame()
 
       const newGuesses: Cell[][] = Array(MAX_GUESSES)
         .fill(null)
@@ -156,7 +78,96 @@ export default function WordleGame() {
       setGameStarted(Number(attempts) > 0 || gameFinished)
     } catch (err) {
       console.error("Error loading game:", err)
+      // Reset to fresh state if loading fails
+      setGameStarted(false)
+      setCurrentRow(0)
+      setGameOver(false)
+      setWon(false)
     }
+  }
+
+  // Connect to a specific account and load their game state
+  const connectAccount = useCallback(async (browserProvider: ethers.BrowserProvider, accountAddress: string) => {
+    const signer = await browserProvider.getSigner(accountAddress)
+    const wordleContract = new ethers.Contract(WORDLE_ADDRESS, WORDLE_ABI, signer)
+    setContract(wordleContract)
+    setAccount(accountAddress)
+    setCurrentGuess("")
+    await loadGameFromContract(wordleContract)
+  }, [])
+
+  // Initialize wallet and user
+  useEffect(() => {
+    const init = async () => {
+      if (typeof window.ethereum !== "undefined") {
+        const browserProvider = new ethers.BrowserProvider(window.ethereum)
+        setProvider(browserProvider)
+
+        const accounts = await browserProvider.send("eth_requestAccounts", [])
+        if (accounts.length > 0) {
+          await connectAccount(browserProvider, accounts[0])
+        }
+
+        window.ethereum.on("accountsChanged", (async (accounts: unknown) => {
+          const newAccounts = accounts as string[];
+          if (newAccounts.length > 0) {
+            await connectAccount(browserProvider, newAccounts[0])
+          } else {
+            setAccount("")
+            setContract(null)
+          }
+        }))
+      } else {
+        setError("Please install a Web3 wallet to play!")
+      }
+    }
+    init()
+
+    return () => {
+      if (window.ethereum?.removeListener) {
+        window.ethereum.removeListener("accountsChanged", () => { })
+      }
+    }
+  }, [connectAccount])
+
+  // Request to switch account via wallet
+  const [switchingAccount, setSwitchingAccount] = useState(false)
+  const handleSwitchAccount = async () => {
+    if (!window.ethereum || switchingAccount) return
+
+    setSwitchingAccount(true)
+    try {
+      await window.ethereum.request({
+        method: "wallet_requestPermissions",
+        params: [{ eth_accounts: {} }],
+      })
+    } catch (err: unknown) {
+      // Ignore "already pending" errors (user clicked multiple times)
+      const error = err as { code?: number }
+      if (error.code !== -32002) {
+        console.error("Error switching account:", err)
+      }
+    } finally {
+      setSwitchingAccount(false)
+    }
+  }
+
+  // Convert string to bytes5 hex for Smart Contract
+  const stringToBytes5 = (str: string): string => {
+    const bytes = ethers.toUtf8Bytes(str.toUpperCase().padEnd(5, " ").slice(0, 5))
+    return ethers.hexlify(bytes)
+  }
+
+  // Convert bytes5 hex to string for display
+  const bytes5ToString = (hex: string): string => {
+    if (hex === "0x0000000000") return ""
+    return ethers.toUtf8String(hex).trim()
+  }
+
+  // Load game state from contract (uses current contract from state)
+  const loadGameState = useCallback(async () => {
+    if (!contract) return
+    await loadGameFromContract(contract)
   }, [contract])
 
   // Load game state on mount
@@ -260,7 +271,7 @@ export default function WordleGame() {
         <div className="bg-white rounded-lg shadow-xl p-8 max-w-md text-center">
           <h1 className="text-4xl font-bold mb-4 text-gray-800">Wordle</h1>
           <p className="text-red-600 mb-6">
-            {error || "Please install MetaMask to play!"}
+            {error || "Please install some web3 wallet to play!"}
           </p>
         </div>
       </div>
